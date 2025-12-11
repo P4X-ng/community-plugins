@@ -1,3 +1,17 @@
+# Binary Ninja Community Plugins
+
+⚠️ **Plugin Maintenance Notice**: This repository has undergone cleanup to remove outdated and obsolete plugins. For detailed information about plugin age and maintenance status, see [PLUGIN_ANALYSIS.md](PLUGIN_ANALYSIS.md).
+
+**Current Status (as of 2025-12-11):**
+- Total Plugins: 175
+- Recently Updated (<2 years): 84 plugins
+- Older but Stable (2-5 years): 63 plugins  
+- Very Old (>5 years): 28 plugins
+
+For information about removed plugins and rationale, see [PROPOSED_CHANGES.md](PROPOSED_CHANGES.md).
+
+## Plugin Listing
+
 | Name|Author|Description|Last Updated|Type|API|License |
 | ----|------|-----------|------------|----|---|------- |
 | [0CD](https://github.com/0xb0bb/0CD)|b0bb|Quality of life utilities for obsessive compulsive CTF enthusiasts.|2022-02-17|helper|python3|MIT |
