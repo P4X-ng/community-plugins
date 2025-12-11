@@ -32,17 +32,37 @@ PLUGINS_TO_REMOVE = [
 
 def load_plugins(filepath):
     """Load plugins from JSON file"""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Error: File not found: {filepath}", file=sys.stderr)
+        raise
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in {filepath}: {e}", file=sys.stderr)
+        raise
+    except IOError as e:
+        print(f"Error: Could not read {filepath}: {e}", file=sys.stderr)
+        raise
 
 def save_plugins(filepath, plugins):
     """Save plugins to JSON file with nice formatting"""
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(plugins, f, indent=2, ensure_ascii=False)
-        f.write('\n')  # Add trailing newline
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(plugins, f, indent=2, ensure_ascii=False)
+            f.write('\n')  # Add trailing newline
+    except IOError as e:
+        print(f"Error: Could not write to {filepath}: {e}", file=sys.stderr)
+        raise
 
 def remove_plugins(plugins, plugins_to_remove, dry_run=False):
     """Remove specified plugins from the list"""
+    # Validate plugins_to_remove entries
+    for p in plugins_to_remove:
+        if 'name' not in p:
+            print(f"Error: Invalid entry in plugins_to_remove: {p}", file=sys.stderr)
+            raise ValueError("All entries in plugins_to_remove must have a 'name' key")
+    
     plugins_to_remove_names = {p['name'] for p in plugins_to_remove}
     removed_plugins = []
     remaining_plugins = []
@@ -54,7 +74,11 @@ def remove_plugins(plugins, plugins_to_remove, dry_run=False):
                 print(f"✓ Removed: {plugin['name']}")
             else:
                 print(f"Would remove: {plugin['name']}")
-                reason = next(p['reason'] for p in plugins_to_remove if p['name'] == plugin['name'])
+                # Use next with default to avoid StopIteration
+                reason = next(
+                    (p['reason'] for p in plugins_to_remove if p.get('name') == plugin['name']),
+                    'No reason provided'
+                )
                 print(f"  Reason: {reason}")
                 print(f"  Last Updated: {plugin.get('lastUpdated', 'Unknown')}")
                 print(f"  Author: {plugin.get('author', 'Unknown')}")
@@ -114,8 +138,11 @@ def main():
     if removed_plugins:
         print("\nRemoved plugins:")
         for plugin in removed_plugins:
-            reason = next(p['reason'] for p in PLUGINS_TO_REMOVE 
-                         if p['name'] == plugin['name'])
+            # Use next with default to avoid StopIteration
+            reason = next(
+                (p['reason'] for p in PLUGINS_TO_REMOVE if p.get('name') == plugin['name']),
+                'No reason provided'
+            )
             print(f"  - {plugin['name']}: {reason}")
     
     # Save if not dry run
