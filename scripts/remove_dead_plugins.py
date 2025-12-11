@@ -74,7 +74,7 @@ def remove_plugins(plugins, plugins_to_remove, dry_run=False):
                 print(f"✓ Removed: {plugin['name']}")
             else:
                 print(f"Would remove: {plugin['name']}")
-                # Use next with default to avoid StopIteration
+                # Find reason, with fallback if plugin not found in removal list
                 reason = next(
                     (p['reason'] for p in plugins_to_remove if p.get('name') == plugin['name']),
                     'No reason provided'
@@ -138,7 +138,7 @@ def main():
     if removed_plugins:
         print("\nRemoved plugins:")
         for plugin in removed_plugins:
-            # Use next with default to avoid StopIteration
+            # Find reason for removal, with fallback if not found
             reason = next(
                 (p['reason'] for p in PLUGINS_TO_REMOVE if p.get('name') == plugin['name']),
                 'No reason provided'
