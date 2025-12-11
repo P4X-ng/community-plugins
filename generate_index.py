@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+Binary Ninja Plugin Repository Index Generator
+
+This script generates the plugin index by fetching metadata from GitHub repositories
+and creating the plugins.json file and README.md table.
+"""
 import sys
 import os
 import json
@@ -7,248 +13,493 @@ import base64
 import requests
 from dateutil import parser
 import re
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Any, Union
+from dataclasses import dataclass
+import time
 
-token = None
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('plugin_generation.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
-def printProgressBar(iteration, total, prefix = '', length = 60, fill = '█'):
-    filledLength = int(length * iteration // total)
-    bar = (fill * filledLength) + ('-' * (length - filledLength))
+@dataclass
+class Config:
+    """Configuration constants for the plugin generator."""
+    CURRENT_PLUGIN_METADATA_VERSION: int = 2
+    MAX_DESCRIPTION_LENGTH: int = 100
+    PROGRESS_BAR_LENGTH: int = 60
+    PROGRESS_BAR_FILL: str = '█'
+    GITHUB_API_BASE: str = "https://api.github.com"
+    GITHUB_SITE_BASE: str = "https://github.com"
+    RATE_LIMIT_DELAY: float = 0.1  # Delay between API calls
+    MAX_RETRIES: int = 3
+    RETRY_DELAY: float = 1.0
+
+config = Config()
+
+class GitHubAPIError(Exception):
+    """Custom exception for GitHub API errors."""
+    pass
+
+class PluginProcessingError(Exception):
+    """Custom exception for plugin processing errors."""
+    pass
+
+def print_progress_bar(iteration: int, total: int, prefix: str = '', 
+                      length: int = None, fill: str = None) -> None:
+    """
+    Display a progress bar in the terminal.
+    
+    Args:
+        iteration: Current iteration
+        total: Total iterations
+        prefix: Prefix string
+        length: Length of progress bar
+        fill: Fill character
+    """
+    if length is None:
+        length = config.PROGRESS_BAR_LENGTH
+    if fill is None:
+        fill = config.PROGRESS_BAR_FILL
+        
+    filled_length = int(length * iteration // total)
+    bar = (fill * filled_length) + ('-' * (length - filled_length))
     percent = 100 * (iteration / float(total))
     fmt = f"\r{prefix} |{bar}| {percent:.1f}%"
     sys.stdout.write(fmt)
+    sys.stdout.flush()
+    
     # Print New Line on Complete
     if iteration == total:
         print()
 
 
-def getfile(url):
-    return requests.get(url, headers={'Authorization': f'token {token}'})
+class GitHubAPIClient:
+    """GitHub API client with session management and rate limiting."""
+    
+    def __init__(self, token: str):
+        self.token = token
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'token {token}',
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'BinaryNinja-Plugin-Repository-Generator'
+        })
+        
+    def get_file(self, url: str) -> requests.Response:
+        """
+        Get a file from GitHub API with retry logic and rate limiting.
+        
+        Args:
+            url: GitHub API URL
+            
+        Returns:
+            Response object
+            
+        Raises:
+            GitHubAPIError: If API request fails after retries
+        """
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                # Add rate limiting delay
+                time.sleep(config.RATE_LIMIT_DELAY)
+                
+                response = self.session.get(url, timeout=30)
+                
+                # Check for rate limiting
+                if response.status_code == 403 and 'rate limit' in response.text.lower():
+                    reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+                    current_time = int(time.time())
+                    sleep_time = max(reset_time - current_time, 60)
+                    logger.warning(f"Rate limited. Sleeping for {sleep_time} seconds.")
+                    time.sleep(sleep_time)
+                    continue
+                    
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
+                if attempt == config.MAX_RETRIES - 1:
+                    raise GitHubAPIError(f"Failed to fetch {url} after {config.MAX_RETRIES} attempts: {e}")
+                time.sleep(config.RETRY_DELAY * (2 ** attempt))  # Exponential backoff
+                
+        raise GitHubAPIError(f"Unexpected error fetching {url}")
+
+# Global API client instance
+api_client: Optional[GitHubAPIClient] = None
 
 
-def getPluginJson(plugin, shortUrls, debug=False):
+def get_plugin_json(plugin: Dict[str, Any], short_urls: Dict[str, str], debug: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Process a plugin entry and return its metadata.
+    
+    Args:
+        plugin: Plugin configuration from listing.json
+        short_urls: Cache of shortened URLs
+        debug: Enable debug logging
+        
+    Returns:
+        Plugin metadata dictionary or None if processing fails
+    """
     if debug:
-        print(f"Processing plugin: {plugin['name']}")
-    if "site" in plugin:
-        pluginsJson = getfile(plugin["site"]).json()
-        for plugin in pluginsJson:
-            if plugin["name"] == plugin["name"]:
-                return plugin
-        print(f'No plugin matching {plugin["name"]} found in {plugin["site"]}')
-        return
-
-    site = "https://github.com/"
-    userAndProject = plugin["name"]
-    userName = plugin["name"].split("/")[0]
-    projectUrl = f"https://api.github.com/repos/{userAndProject}"
-    releasesUrl = f"{projectUrl}/releases/tags"
-    tagsUrl = f"{projectUrl}/tags"
-
-    releaseData = None
-    if 'view_only' in plugin and plugin['view_only']:
-        view_only = True
-    else:
-        view_only = False
-
-    if 'auto_update' in plugin and plugin['auto_update']:
-        latestRelease = f"{projectUrl}/releases/latest"
-
-        try:
-            releaseData = getfile(latestRelease).json()
-
-            match releaseData.get('message'):
-                case 'Not Found':
-                    print(f"\n\nERROR: {plugin['name']}, Couldn't get release information. Likely the user created a tag but no associated release.\n")
-                    return None
-                case 'Bad credentials':
-                    print(f"\n\nERROR: Bad credentials, check access token.\n")
-                    return None
-
-            plugin['tag'] = releaseData['tag_name']
-
-        except requests.exceptions.HTTPError:
-            print(f" Unable to get url {latestRelease}")
-            return None
-    elif view_only:
-        # No release for a view-only plugin
-        pass
-    else:
-        releases = f"{releasesUrl}/{plugin['tag']}"
-        try:
-            releaseData = getfile(releases).json()
-            if "message" in releaseData and releaseData["message"] == "Not Found":
-                print(f"\n\nERROR: {plugin['name']}, Couldn't get release information. Likely the user created a tag but no associated release.\n")
-                print(f"Tried to use URL: {releases}")
-                return None
-        except requests.exceptions.HTTPError:
-            print(f" Unable to get url {releases}")
-            return None
-
-    commit = None
-    zipUrl = None
-    shortUrl = ""
-    # Lookup the tag url and find the associated commit
-    if not view_only:
-        try:
-            tagData = getfile(tagsUrl).json()
-            for tag in tagData:
-                if tag["name"] == plugin["tag"]:
-                    commit = tag["commit"]["sha"]
-                    zipUrl = tag["zipball_url"]
-                    break
-            if commit is None:
-                print(f"Unable to associate tag {plugin['tag']} with a commit for plugin {plugin['name']}")
-                return None
-        except requests.exceptions.HTTPError:
-            print(f" Unable to get url {tagsUrl}")
-            return None
-
-        if zipUrl in shortUrls: #avoid duplicates
-            shortUrl = shortUrls[zipUrl]
-        elif os.getenv("URL_SHORTENER"):
-            url = os.getenv("URL_SHORTENER")
-            assert url != "", "No URL_SHORTENER environment variable."
-            jsonData = {"cdn_prefix": "v35.us", "url_long": zipUrl}
-            r = requests.post(url, json=jsonData)
-            jsonResponse = json.loads(r.text)
-            if jsonResponse['error'] == '':
-                shortUrl = jsonResponse["url_short"]
-            assert shortUrl.find("http") == 0
-
-    projectData = None
+        logger.debug(f"Processing plugin: {plugin['name']}")
+        
     try:
-        projectData = getfile(projectUrl).json()
-    except requests.exceptions.HTTPError:
-        print(f" Unable to get url {projectUrl}")
+        if "site" in plugin:
+            return _process_external_site_plugin(plugin, debug)
+        else:
+            return _process_github_plugin(plugin, short_urls, debug)
+    except Exception as e:
+        logger.error(f"Failed to process plugin {plugin['name']}: {e}")
         return None
 
-    data = None
-    if "subdir" in plugin:
+def _process_external_site_plugin(plugin: Dict[str, Any], debug: bool) -> Optional[Dict[str, Any]]:
+    """Process a plugin from an external site."""
+    try:
+        response = api_client.get_file(plugin["site"])
+        plugins_json = response.json()
+        
+        for site_plugin in plugins_json:
+            if site_plugin["name"] == plugin["name"]:
+                return site_plugin
+                
+        logger.error(f'No plugin matching {plugin["name"]} found in {plugin["site"]}')
+        return None
+    except Exception as e:
+        logger.error(f"Failed to process external site plugin {plugin['name']}: {e}")
+        return None
+
+def _process_github_plugin(plugin: Dict[str, Any], short_urls: Dict[str, str], debug: bool) -> Optional[Dict[str, Any]]:
+    """Process a plugin from GitHub."""
+    user_and_project = plugin["name"]
+    user_name = user_and_project.split("/")[0]
+    project_url = f"{config.GITHUB_API_BASE}/repos/{user_and_project}"
+    
+    view_only = plugin.get('view_only', False)
+    auto_update = plugin.get('auto_update', False)
+    
+    # Get release data
+    release_data = None
+    if auto_update:
+        release_data = _get_latest_release(project_url, plugin["name"])
+        if release_data is None:
+            return None
+        plugin['tag'] = release_data['tag_name']
+    elif not view_only:
+        release_data = _get_specific_release(project_url, plugin["tag"], plugin["name"])
+        if release_data is None:
+            return None
+    
+    # Get commit and zip URL
+    commit, zip_url = None, None
+    if not view_only:
+        commit, zip_url = _get_tag_info(project_url, plugin["tag"], plugin["name"])
+        if commit is None:
+            return None
+    
+    # Get project data
+    project_data = _get_project_data(project_url, plugin["name"])
+    if project_data is None:
+        return None
+    
+    # Get plugin.json content
+    plugin_json_data = _get_plugin_json_content(project_url, plugin, view_only, debug)
+    if plugin_json_data is None:
+        return None
+    
+    # Get requirements.txt if available
+    requirements_txt = _get_requirements_txt(project_url, plugin, view_only)
+    
+    # Process URLs
+    short_url = _process_urls(zip_url, short_urls, view_only)
+    
+    # Build final plugin data
+    return _build_plugin_data(
+        plugin_json_data, plugin, project_data, user_name, 
+        release_data, zip_url, short_url, commit, requirements_txt, view_only
+    )
+
+def _get_latest_release(project_url: str, plugin_name: str) -> Optional[Dict[str, Any]]:
+    """Get the latest release data for a plugin."""
+    latest_release_url = f"{project_url}/releases/latest"
+    
+    try:
+        response = api_client.get_file(latest_release_url)
+        release_data = response.json()
+        
+        if release_data.get('message') == 'Not Found':
+            logger.error(f"{plugin_name}: Couldn't get release information. "
+                        "Likely the user created a tag but no associated release.")
+            return None
+        elif release_data.get('message') == 'Bad credentials':
+            logger.error("Bad credentials, check access token.")
+            return None
+            
+        return release_data
+        
+    except Exception as e:
+        logger.error(f"Unable to get latest release for {plugin_name}: {e}")
+        return None
+
+def _get_specific_release(project_url: str, tag: str, plugin_name: str) -> Optional[Dict[str, Any]]:
+    """Get specific release data for a plugin."""
+    releases_url = f"{project_url}/releases/tags/{tag}"
+    
+    try:
+        response = api_client.get_file(releases_url)
+        release_data = response.json()
+        
+        if release_data.get("message") == "Not Found":
+            logger.error(f"{plugin_name}: Couldn't get release information for tag {tag}. "
+                        f"Tried URL: {releases_url}")
+            return None
+            
+        return release_data
+        
+    except Exception as e:
+        logger.error(f"Unable to get release for {plugin_name} tag {tag}: {e}")
+        return None
+
+def _get_tag_info(project_url: str, tag: str, plugin_name: str) -> tuple[Optional[str], Optional[str]]:
+    """Get commit hash and zip URL for a specific tag."""
+    tags_url = f"{project_url}/tags"
+    
+    try:
+        response = api_client.get_file(tags_url)
+        tag_data = response.json()
+        
+        for tag_info in tag_data:
+            if tag_info["name"] == tag:
+                return tag_info["commit"]["sha"], tag_info["zipball_url"]
+                
+        logger.error(f"Unable to associate tag {tag} with a commit for plugin {plugin_name}")
+        return None, None
+        
+    except Exception as e:
+        logger.error(f"Unable to get tag info for {plugin_name}: {e}")
+        return None, None
+
+def _get_project_data(project_url: str, plugin_name: str) -> Optional[Dict[str, Any]]:
+    """Get project metadata from GitHub."""
+    try:
+        response = api_client.get_file(project_url)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Unable to get project data for {plugin_name}: {e}")
+        return None
+
+def _get_plugin_json_content(project_url: str, plugin: Dict[str, Any], view_only: bool, debug: bool) -> Optional[Dict[str, Any]]:
+    """Get and parse plugin.json content from GitHub."""
+    subdir = plugin.get("subdir", "")
+    
+    if subdir:
         if view_only:
-            pluginjson = f"{projectUrl}/contents/{plugin['subdir']}/plugin.json"
+            plugin_json_url = f"{project_url}/contents/{subdir}/plugin.json"
         else:
-            pluginjson = f"{projectUrl}/contents/{plugin['subdir']}/plugin.json?ref={plugin['tag']}"
+            plugin_json_url = f"{project_url}/contents/{subdir}/plugin.json?ref={plugin['tag']}"
     else:
         if view_only:
-            pluginjson = f"{projectUrl}/contents/plugin.json"
+            plugin_json_url = f"{project_url}/contents/plugin.json"
         else:
-            pluginjson = f"{projectUrl}/contents/plugin.json?ref={plugin['tag']}"
+            plugin_json_url = f"{project_url}/contents/plugin.json?ref={plugin['tag']}"
+    
     try:
         if debug:
-            print(f"Getting plugin.json from {pluginjson}")
-        content = getfile(pluginjson).json()['content']
-        try:
-            data = json.loads(base64.b64decode(content))
-        except:
-            print(f"\n\nInvalid json when parsing {pluginjson}\n")
-            raise
-        if ('longdescription' in data and len(data['longdescription']) < 100) or ('longdescription' not in data):
-            try:
-                readmes = ["README.md", "README.MD", "readme.md", "README", "readme", "Readme.md"]
-                if "subdir" in plugin:
-                    # Yes, this is suboptimal but I'd rather waste time at generation of this list to make sure we get better long descriptions
-                    readmes = [f"{plugin['subdir']}/{x}" for x in readmes] + readmes
-                for readmefile in readmes:
-                    if view_only:
-                        readmeUrl = f"{projectUrl}/contents/{readmefile}"
-                    else:
-                        readmeUrl = f"{projectUrl}/contents/{readmefile}?ref={plugin['tag']}"
-                    readmeJson = getfile(readmeUrl).json()
-                    if all (k in readmeJson for k in ("encoding", "content")):
-                        if readmeJson["encoding"] == "base64":
-                            data['longdescription'] = base64.b64decode(readmeJson["content"]).decode('utf-8')
-                            break
-            except:
-                pass
+            logger.debug(f"Getting plugin.json from {plugin_json_url}")
+            
+        response = api_client.get_file(plugin_json_url)
+        content = response.json()['content']
+        data = json.loads(base64.b64decode(content))
+        
+        # Handle old-style plugin.json format
         if "plugin" in data:
-            # Using old style json
             data = data["plugin"]
-    except requests.exceptions.HTTPError:
-        print(f" Unable to get url {pluginjson}")
+            
+        # Try to get README if longdescription is missing or short
+        if ('longdescription' in data and len(data['longdescription']) < config.MAX_DESCRIPTION_LENGTH) or ('longdescription' not in data):
+            data = _add_readme_content(project_url, plugin, data, view_only)
+            
+        return data
+        
+    except Exception as e:
+        logger.error(f"Unable to get plugin.json from {plugin_json_url}: {e}")
         return None
 
-    requirements_txt = ""
-    if not view_only:
+def _add_readme_content(project_url: str, plugin: Dict[str, Any], data: Dict[str, Any], view_only: bool) -> Dict[str, Any]:
+    """Try to add README content as longdescription if missing."""
+    readme_files = ["README.md", "README.MD", "readme.md", "README", "readme", "Readme.md"]
+    subdir = plugin.get("subdir", "")
+    
+    if subdir:
+        # Try both subdir and root level READMEs
+        readme_files = [f"{subdir}/{x}" for x in readme_files] + readme_files
+    
+    for readme_file in readme_files:
         try:
-            if "subdir" in plugin:
-                req_json = getfile(f"{projectUrl}/contents/{plugin['subdir']}/requirements.txt?ref={plugin['tag']}").json()
-                if not "content" in req_json: # Try top-level requirements as well
-                    req_json = getfile(f"{projectUrl}/contents/requirements.txt?ref={plugin['tag']}").json()
+            if view_only:
+                readme_url = f"{project_url}/contents/{readme_file}"
             else:
-                req_json = getfile(f"{projectUrl}/contents/requirements.txt?ref={plugin['tag']}").json()
-            if "content" in req_json:
-                requirements_txt = base64.b64decode(req_json["content"]).decode('utf-8')
-                if requirements_txt.startswith("\ufeff"):  # Remove BOM from file contents
-                    requirements_txt = requirements_txt[1:]
-                requirements_txt = requirements_txt.replace("\r\n", "\n")
-        except requests.exceptions.HTTPError:
-            pass
-
-    # Additional fields required for internal use
-    if view_only:
-        lastUpdated = int(parser.parse(projectData["updated_at"]).timestamp())
-    else:
-        lastUpdated = int(parser.parse(releaseData["published_at"]).timestamp())
-    data["lastUpdated"] = lastUpdated
-    data["projectUrl"] = site + userAndProject
-    data["projectData"] = projectData
-    data["projectData"]["updated_at"] = datetime.fromtimestamp(lastUpdated, timezone.utc).isoformat()
-    data["authorUrl"] = site + userName
-    if view_only:
-        # Hack until new system is finished
-        data["packageUrl"] = "https://127.0.0.1/"
-        data["packageShortUrl"] = "https://127.0.0.1/"
-        data["view_only"] = True
-    else:
-        data["packageUrl"] = zipUrl
-        data["packageShortUrl"] = shortUrl
-        data["view_only"] = False
-    data["dependencies"] = requirements_txt
-
-    # Replace the fwd slash with _ and then strip all non (alpha, numeric, _ )
-
-    data["path"] = re.sub("[^a-zA-Z0-9_]", "", re.sub("/", "_", projectData["full_name"]))
-    data["commit"] = commit
-
-    # TODO: Consider adding license info directly from the repository's json data (would need to test unlicensed plugins)
-    # data["license"] = {"name" : data["license"]["name"], "text": getfile(data["license"]["url"])}
-
-    if "api" in data.keys() and isinstance(data["api"], str):
-        data["api"] = [data["api"]]
-
-    if "minimumbinaryninjaversion" in data:
-        if not isinstance(data["minimumbinaryninjaversion"], int):
-            data["minimumBinaryNinjaVersion"] = 0
-        else:
-            data["minimumBinaryNinjaVersion"] = data["minimumbinaryninjaversion"]
-        del data["minimumbinaryninjaversion"]
-    elif "minimumBinaryNinjaVersion" in data:
-        if not isinstance(data["minimumBinaryNinjaVersion"], int):
-            data["minimumBinaryNinjaVersion"] = 0
-    else:
-        data["minimumBinaryNinjaVersion"] = 0
-
-    if "pluginmetadataversion" not in data:
-        data["pluginmetadataversion"] = 2  # For any plugin to use v3+ schema features, they need to set this
-
-    if ("maximumBinaryNinjaVersion" not in data or not isinstance(data["maximumBinaryNinjaVersion"], int)):
-        data["maximumBinaryNinjaVersion"] = 999999
-    if "platforms" not in data:
-        data["platforms"] = []
-    if "installinstructions" not in data:
-        data["installinstructions"] = {}
-    if "subdir" in plugin:
-        data["subdir"] = plugin["subdir"]
-    # Native plugins require this version to not produce error logs.
-    if view_only and data["minimumBinaryNinjaVersion"] < 6135:
-        data["minimumBinaryNinjaVersion"] = 6135
-    if debug:
-        print(f"Finished processing plugin: {plugin['name']}")
+                readme_url = f"{project_url}/contents/{readme_file}?ref={plugin['tag']}"
+                
+            response = api_client.get_file(readme_url)
+            readme_json = response.json()
+            
+            if all(k in readme_json for k in ("encoding", "content")):
+                if readme_json["encoding"] == "base64":
+                    data['longdescription'] = base64.b64decode(readme_json["content"]).decode('utf-8')
+                    break
+        except Exception:
+            # Continue trying other README files
+            continue
+            
     return data
 
+def _get_requirements_txt(project_url: str, plugin: Dict[str, Any], view_only: bool) -> str:
+    """Get requirements.txt content if available."""
+    if view_only:
+        return ""
+        
+    requirements_txt = ""
+    subdir = plugin.get("subdir", "")
+    
+    try:
+        if subdir:
+            req_url = f"{project_url}/contents/{subdir}/requirements.txt?ref={plugin['tag']}"
+            response = api_client.get_file(req_url)
+            req_json = response.json()
+            
+            if "content" not in req_json:  # Try top-level requirements as well
+                req_url = f"{project_url}/contents/requirements.txt?ref={plugin['tag']}"
+                response = api_client.get_file(req_url)
+                req_json = response.json()
+        else:
+            req_url = f"{project_url}/contents/requirements.txt?ref={plugin['tag']}"
+            response = api_client.get_file(req_url)
+            req_json = response.json()
+            
+        if "content" in req_json:
+            requirements_txt = base64.b64decode(req_json["content"]).decode('utf-8')
+            if requirements_txt.startswith("\ufeff"):  # Remove BOM
+                requirements_txt = requirements_txt[1:]
+            requirements_txt = requirements_txt.replace("\r\n", "\n")
+            
+    except Exception:
+        # Requirements.txt is optional
+        pass
+        
+    return requirements_txt
+
+def _process_urls(zip_url: Optional[str], short_urls: Dict[str, str], view_only: bool) -> str:
+    """Process and potentially shorten URLs."""
+    if view_only or zip_url is None:
+        return ""
+        
+    # Check if we already have a short URL for this zip URL
+    if zip_url in short_urls:
+        return short_urls[zip_url]
+        
+    # Try to use URL shortener if configured
+    url_shortener = os.getenv("URL_SHORTENER")
+    if url_shortener:
+        try:
+            json_data = {"cdn_prefix": "v35.us", "url_long": zip_url}
+            response = requests.post(url_shortener, json=json_data, timeout=10)
+            json_response = response.json()
+            
+            if json_response.get('error') == '':
+                short_url = json_response.get("url_short", "")
+                if short_url.startswith("http"):
+                    return short_url
+        except Exception as e:
+            logger.warning(f"Failed to shorten URL {zip_url}: {e}")
+            
+    return ""
+
+def _build_plugin_data(plugin_json_data: Dict[str, Any], plugin: Dict[str, Any], 
+                      project_data: Dict[str, Any], user_name: str, 
+                      release_data: Optional[Dict[str, Any]], zip_url: Optional[str], 
+                      short_url: str, commit: Optional[str], requirements_txt: str, 
+                      view_only: bool) -> Dict[str, Any]:
+    """Build the final plugin data structure."""
+    # Determine last updated timestamp
+    if view_only:
+        last_updated = int(parser.parse(project_data["updated_at"]).timestamp())
+    else:
+        last_updated = int(parser.parse(release_data["published_at"]).timestamp())
+    
+    # Add required fields
+    plugin_json_data["lastUpdated"] = last_updated
+    plugin_json_data["projectUrl"] = f"{config.GITHUB_SITE_BASE}/{plugin['name']}"
+    plugin_json_data["projectData"] = project_data
+    plugin_json_data["projectData"]["updated_at"] = datetime.fromtimestamp(last_updated, timezone.utc).isoformat()
+    plugin_json_data["authorUrl"] = f"{config.GITHUB_SITE_BASE}/{user_name}"
+    
+    if view_only:
+        plugin_json_data["packageUrl"] = "https://127.0.0.1/"
+        plugin_json_data["packageShortUrl"] = "https://127.0.0.1/"
+        plugin_json_data["view_only"] = True
+    else:
+        plugin_json_data["packageUrl"] = zip_url or ""
+        plugin_json_data["packageShortUrl"] = short_url
+        plugin_json_data["view_only"] = False
+        
+    plugin_json_data["dependencies"] = requirements_txt
+    
+    # Clean up the project name for path
+    plugin_json_data["path"] = re.sub(r"[^a-zA-Z0-9_]", "", re.sub(r"/", "_", project_data["full_name"]))
+    plugin_json_data["commit"] = commit
+    
+    # Normalize API field
+    if "api" in plugin_json_data and isinstance(plugin_json_data["api"], str):
+        plugin_json_data["api"] = [plugin_json_data["api"]]
+    
+    # Handle version fields
+    if "minimumbinaryninjaversion" in plugin_json_data:
+        if not isinstance(plugin_json_data["minimumbinaryninjaversion"], int):
+            plugin_json_data["minimumBinaryNinjaVersion"] = 0
+        else:
+            plugin_json_data["minimumBinaryNinjaVersion"] = plugin_json_data["minimumbinaryninjaversion"]
+        del plugin_json_data["minimumbinaryninjaversion"]
+    elif "minimumBinaryNinjaVersion" in plugin_json_data:
+        if not isinstance(plugin_json_data["minimumBinaryNinjaVersion"], int):
+            plugin_json_data["minimumBinaryNinjaVersion"] = 0
+    else:
+        plugin_json_data["minimumBinaryNinjaVersion"] = 0
+    
+    # Set default values for missing fields
+    if "pluginmetadataversion" not in plugin_json_data:
+        plugin_json_data["pluginmetadataversion"] = config.CURRENT_PLUGIN_METADATA_VERSION
+        
+    if "maximumBinaryNinjaVersion" not in plugin_json_data or not isinstance(plugin_json_data["maximumBinaryNinjaVersion"], int):
+        plugin_json_data["maximumBinaryNinjaVersion"] = 999999
+        
+    if "platforms" not in plugin_json_data:
+        plugin_json_data["platforms"] = []
+        
+    if "installinstructions" not in plugin_json_data:
+        plugin_json_data["installinstructions"] = {}
+        
+    if "subdir" in plugin:
+        plugin_json_data["subdir"] = plugin["subdir"]
+        
+    # Native plugins require minimum version to avoid error logs
+    if view_only and plugin_json_data["minimumBinaryNinjaVersion"] < 6135:
+        plugin_json_data["minimumBinaryNinjaVersion"] = 6135
+        
+    return plugin_json_data
 
 def main():
+    """Main function to generate plugin index."""
     parser = argparse.ArgumentParser(description="Produce 'plugins.json' for plugin repository.")
     parser.add_argument("-i", "--initialize", action="store_true", default=False,
         help="For first time running the command against the old format")
@@ -257,98 +508,149 @@ def main():
     parser.add_argument("-l", "--listing", action="store", default="listing.json")
     parser.add_argument("-d", "--debug", action="store_true", default=False,
         help="Debugging output")
-    parser.add_argument("token")
-    args = parser.parse_args(sys.argv[1:])
-    global token
-    token = args.token
-
-    pluginjson = Path("./plugins.json")
-
-    oldPlugins = {}
-    shortUrls = {}
-    if pluginjson.exists():
-        with open(pluginjson) as pluginsFile:
-            for i, plugin in enumerate(json.load(pluginsFile)):
-                # Create lookup for existing urls to avoid duplication
-                if "packageShortUrl" in plugin and len(plugin["packageShortUrl"]) > 0:
-                    shortUrls[plugin["packageUrl"]] = plugin["packageShortUrl"]
-                oldPlugins[plugin["projectData"]["full_name"]] = plugin["lastUpdated"]
-
-    allPlugins = {}
-    listing = json.load(open(args.listing, "r", encoding="utf-8"))
+    parser.add_argument("token", help="GitHub API token")
+    args = parser.parse_args()
+    
+    # Set up logging level
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Initialize global API client
+    global api_client
+    api_client = GitHubAPIClient(args.token)
+    
+    plugins_json_path = Path("./plugins.json")
+    
+    # Load existing plugins for comparison
+    old_plugins = {}
+    short_urls = {}
+    if plugins_json_path.exists():
+        try:
+            with open(plugins_json_path, encoding='utf-8') as plugins_file:
+                existing_plugins = json.load(plugins_file)
+                for plugin in existing_plugins:
+                    # Create lookup for existing URLs to avoid duplication
+                    if "packageShortUrl" in plugin and len(plugin["packageShortUrl"]) > 0:
+                        short_urls[plugin["packageUrl"]] = plugin["packageShortUrl"]
+                    old_plugins[plugin["projectData"]["full_name"]] = plugin["lastUpdated"]
+        except Exception as e:
+            logger.error(f"Failed to load existing plugins.json: {e}")
+            return 1
+    
+    # Load plugin listing
+    try:
+        with open(args.listing, "r", encoding="utf-8") as listing_file:
+            listing = json.load(listing_file)
+    except Exception as e:
+        logger.error(f"Failed to load listing file {args.listing}: {e}")
+        return 1
+    
+    # Process all plugins
+    all_plugins = {}
+    logger.info(f"Processing {len(listing)} plugins...")
+    
     for i, plugin in enumerate(listing):
-        printProgressBar(i, len(listing), prefix="Collecting Plugin JSON files:")
-        jsonData = getPluginJson(plugin, shortUrls, debug=args.debug)
-        if jsonData is not None:
-            allPlugins[plugin["name"]] = jsonData
-    printProgressBar(len(listing), len(listing), prefix="Collecting Plugin JSON files:")
-
-    newPlugins = []
-    updatedPlugins = []
-    removedPlugins = []
-    newList = []
-    for i, (name, pluginData) in enumerate(allPlugins.items()):
-        # printProgressBar(i, len(allPlugins), prefix="Updating plugins.json:")
-        newList.append(name)
-        pluginIsNew = False
-        pluginIsUpdated = False
-        if name not in oldPlugins:
-            pluginIsNew = True
+        print_progress_bar(i, len(listing), prefix="Collecting Plugin JSON files:")
+        json_data = get_plugin_json(plugin, short_urls, debug=args.debug)
+        if json_data is not None:
+            all_plugins[plugin["name"]] = json_data
         else:
-            if name not in oldPlugins:
-                pluginIsUpdated = True
-            else:
-                pluginIsUpdated = pluginData["lastUpdated"] > oldPlugins[name]
-
-        if pluginIsUpdated or pluginIsNew:
-            if pluginIsNew:
-                newPlugins.append(name)
-            elif pluginIsUpdated:
-                updatedPlugins.append(name)
-    for name in oldPlugins:
-        if name not in newList:
-            removedPlugins.append(name)
-
-    printProgressBar(len(allPlugins), len(allPlugins), prefix="Updating plugins.json:       ")
-    allPluginsList = []
-    for name, plugin in allPlugins.items():
-        allPluginsList.append(plugin)
-
-    print(f"{len(newPlugins)} New Plugins:")
-    for plugin in newPlugins:
-        print(f"\t- {plugin}")
-    print(f"{len(updatedPlugins)} Updated Plugins:")
-    for plugin in updatedPlugins:
-        print(f"\t- {plugin}")
-    print(f"{len(removedPlugins)} Removed Plugins:")
-    for plugin in removedPlugins:
-        print(f"\t- {plugin}")
-    print(f"Writing {pluginjson}")
-    with open(pluginjson, "w") as pluginsFile:
-        json.dump(allPluginsList, pluginsFile, indent="    ")
-
+            logger.warning(f"Failed to process plugin: {plugin['name']}")
+    
+    print_progress_bar(len(listing), len(listing), prefix="Collecting Plugin JSON files:")
+    
+    # Analyze changes
+    new_plugins = []
+    updated_plugins = []
+    removed_plugins = []
+    new_list = []
+    
+    for name, plugin_data in all_plugins.items():
+        new_list.append(name)
+        plugin_is_new = name not in old_plugins
+        plugin_is_updated = False
+        
+        if not plugin_is_new:
+            plugin_is_updated = plugin_data["lastUpdated"] > old_plugins[name]
+        
+        if plugin_is_updated or plugin_is_new:
+            if plugin_is_new:
+                new_plugins.append(name)
+            elif plugin_is_updated:
+                updated_plugins.append(name)
+    
+    for name in old_plugins:
+        if name not in new_list:
+            removed_plugins.append(name)
+    
+    # Convert to list for JSON output
+    all_plugins_list = list(all_plugins.values())
+    
+    # Log summary
+    logger.info(f"{len(new_plugins)} New Plugins:")
+    for plugin in new_plugins:
+        logger.info(f"\t- {plugin}")
+    logger.info(f"{len(updated_plugins)} Updated Plugins:")
+    for plugin in updated_plugins:
+        logger.info(f"\t- {plugin}")
+    logger.info(f"{len(removed_plugins)} Removed Plugins:")
+    for plugin in removed_plugins:
+        logger.info(f"\t- {plugin}")
+    
+    # Write plugins.json
+    logger.info(f"Writing {plugins_json_path}")
+    try:
+        with open(plugins_json_path, "w", encoding='utf-8') as plugins_file:
+            json.dump(all_plugins_list, plugins_file, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Failed to write plugins.json: {e}")
+        return 1
+    
+    # Generate README.md if requested
     if not args.readmeskip:
-        info = ""
-        if Path("INFO").exists():
-            info = open("INFO", encoding="utf-8").read() + u"\n"
-        with open("README.md", "w", encoding="utf-8") as readme:
-            readme.write(u"# Binary Ninja Plugins\n\n")
-            readme.write(u"| PluginName | Author | Description | Last Updated | Type | API | License |\n")
-            readme.write(u"|------------|--------|-------------|--------------|------|-----|---------|\n")
+        try:
+            _generate_readme(all_plugins)
+        except Exception as e:
+            logger.error(f"Failed to generate README.md: {e}")
+            return 1
+    
+    logger.info("Plugin index generation completed successfully!")
+    return 0
 
-            for plugin in dict(sorted(allPlugins.items(), key=lambda x: x[1]['name'].casefold())).values():
-                api = plugin["api"][0] if "api" in plugin.keys() and isinstance(plugin["api"], list) and len(plugin["api"]) > 0 else "None"
-                if "type" not in plugin:
-                    plugin['type'] = ["None"]
-                readme.write(f"|[{plugin['name']}]({plugin['projectUrl']})"
-                    f"|[{plugin['author']}]({plugin['authorUrl']})"
-                    f"|{plugin['description']}"
-                    f"|{datetime.fromtimestamp(plugin['lastUpdated']).date()}"
-                    f"|{', '.join(sorted(plugin['type']))}"
-                    f"|{api}"  # API type
-                    f"|{plugin['license']['name']}|\n")
-            readme.write(info)
+def _generate_readme(all_plugins: Dict[str, Dict[str, Any]]) -> None:
+    """Generate README.md file with plugin table."""
+    info = ""
+    info_path = Path("INFO")
+    if info_path.exists():
+        info = info_path.read_text(encoding="utf-8") + "\n"
+    
+    readme_path = Path("README.md")
+    with open(readme_path, "w", encoding="utf-8") as readme:
+        readme.write("# Binary Ninja Plugins\n\n")
+        readme.write("| PluginName | Author | Description | Last Updated | Type | API | License |\n")
+        readme.write("|------------|--------|-------------|--------------|------|-----|---------|\n")
+        
+        # Sort plugins by name (case-insensitive)
+        sorted_plugins = dict(sorted(all_plugins.items(), key=lambda x: x[1]['name'].casefold()))
+        
+        for plugin in sorted_plugins.values():
+            api = plugin["api"][0] if "api" in plugin and isinstance(plugin["api"], list) and len(plugin["api"]) > 0 else "None"
+            if "type" not in plugin:
+                plugin['type'] = ["None"]
+            
+            # Format the table row
+            readme.write(f"|[{plugin['name']}]({plugin['projectUrl']})"
+                f"|[{plugin['author']}]({plugin['authorUrl']})"
+                f"|{plugin['description']}"
+                f"|{datetime.fromtimestamp(plugin['lastUpdated']).date()}"
+                f"|{', '.join(sorted(plugin['type']))}"
+                f"|{api}"
+                f"|{plugin['license']['name']}|\n")
+        
+        readme.write(info)
+    
+    logger.info("README.md generated successfully")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
