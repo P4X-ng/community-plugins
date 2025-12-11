@@ -49,7 +49,7 @@ def save_plugins(filepath, plugins):
     """Save plugins to JSON file with nice formatting"""
     try:
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(plugins, f, indent=2, ensure_ascii=False)
+            json.dump(plugins, f, indent=2, ensure_ascii=False, separators=(',', ': '))
             f.write('\n')  # Add trailing newline
     except IOError as e:
         print(f"Error: Could not write to {filepath}: {e}", file=sys.stderr)
@@ -62,6 +62,9 @@ def remove_plugins(plugins, plugins_to_remove, dry_run=False):
         if 'name' not in p:
             print(f"Error: Invalid entry in plugins_to_remove: {p}", file=sys.stderr)
             raise ValueError("All entries in plugins_to_remove must have a 'name' key")
+        if 'reason' not in p:
+            print(f"Error: Entry missing 'reason' field: {p}", file=sys.stderr)
+            raise ValueError("All entries in plugins_to_remove must have a 'reason' key")
     
     plugins_to_remove_names = {p['name'] for p in plugins_to_remove}
     removed_plugins = []
